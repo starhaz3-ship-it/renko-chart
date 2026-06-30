@@ -92,6 +92,7 @@
       <button class="symbtn" data-sym="XRP">✕ XRP</button>
       <button class="symbtn" data-sym="DOGE">Ð DOGE</button>
       <button class="symbtn" data-sym="AVAX">🔺 AVAX</button>
+      <button class="symbtn" data-sym="SPX500">📈 SPX500</button>
     </div>
     <div class="col" id="colL"><div class="colhead" id="headL"></div><div class="panes">
       <div class="pane pmain" id="Lmain"><div class="tag">5m Renko · Star · Chandelier · Fib</div></div>
@@ -109,12 +110,25 @@
 <script>
 const COL={grid:"#2a1c12",bd:"#43291a",tx:"#f3e3d0",dim:"#b08c6e",gold:"#e0b974",up:"#36d39a",dn:"#ef6b63",mavi:"#5db4ff",kirmizi:"#ff8a5c",ls:"#36d39a",ss:"#ef6b63"};
 const FAPI={BTC:'BTCUSDT',GOLD:'PAXGUSDT',SILVER:'XAGUSDT',ETH:'ETHUSDT',SOL:'SOLUSDT',XRP:'XRPUSDT',DOGE:'DOGEUSDT',AVAX:'AVAXUSDT'};
+// Binance Futures has no equity-index data, so non-crypto symbols (e.g. S&P 500) are routed to the
+// Hyperliquid info API (HIP-3 perps). xyz:SP500 is the XYZ-deployer S&P 500 perp (CORS-open, OHLC candles).
+const HLSYM={SPX500:'xyz:SP500'};
+const HL_INFO='https://api.hyperliquid.xyz/info';
+const HL_MS={'5m':300000,'15m':900000,'1h':3600000};
 function on(id){return document.getElementById(id).checked;}
 function status(m){document.getElementById('status').textContent=m;}
 function bgPaint(){const CT=LightweightCharts.ColorType;return (CT&&CT.VerticalGradient)?{type:CT.VerticalGradient,topColor:"#2a1a10",bottomColor:"#120b06"}:{type:"solid",color:"#1a1009"};}
+// --- date/time labels for the bottom axis (the user-facing "price dates") ---
+function pad2(n){return ('0'+n).slice(-2);}
+function fmtDate(ts){const d=new Date(ts*1000);return pad2(d.getMonth()+1)+'-'+pad2(d.getDate());}
+function fmtDateTime(ts){const d=new Date(ts*1000);return pad2(d.getMonth()+1)+'-'+pad2(d.getDate())+' '+pad2(d.getHours())+':'+pad2(d.getMinutes());}
 function mkChart(el,withTime){return LightweightCharts.createChart(el,{width:el.clientWidth,height:el.clientHeight,
   layout:{background:bgPaint(),textColor:COL.tx,fontSize:11},grid:{vertLines:{color:COL.grid},horzLines:{color:COL.grid}},
-  rightPriceScale:{borderColor:COL.bd,minimumWidth:66},timeScale:{borderColor:COL.bd,timeVisible:true,secondsVisible:false,visible:!!withTime,rightOffset:6},
+  localization:{timeFormatter:fmtDateTime},            // crosshair label shows the full date + time
+  rightPriceScale:{borderColor:COL.bd,minimumWidth:66},
+  timeScale:{borderColor:COL.bd,timeVisible:true,secondsVisible:false,visible:!!withTime,rightOffset:6,
+    // bottom axis: stamp the DATE on every tick (date-only on day boundaries, date+time on intraday ticks)
+    tickMarkFormatter:(withTime?function(t,tt){return tt>=3?fmtDateTime(t):fmtDate(t);}:undefined)},
   crosshair:{mode:LightweightCharts.CrosshairMode.Normal,vertLine:{color:COL.gold,width:1,labelBackgroundColor:"#5a3a1c"},horzLine:{color:COL.gold,width:1,labelBackgroundColor:"#5a3a1c"}}});}
 
 function Column(prefix,headId){
@@ -165,19 +179,29 @@ function Column(prefix,headId){
 let COLS=[],LAST=null,SYM='BTC';
 function setSym(k){SYM=k;document.querySelectorAll('.symbtn').forEach(b=>b.classList.toggle('active',b.dataset.sym===k));poll();}
 function draw(d){if(d['5m'])COLS[0].render(d['5m']);document.getElementById('colR').style.display=d['1h']?'flex':'none';if(d['1h'])COLS[1].render(d['1h']);}
-async function fetchK(sym,interval,limit){const u='https://fapi.binance.com/fapi/v1/klines?symbol='+sym+'&interval='+interval+'&limit='+limit;const r=await fetch(u);if(!r.ok)throw new Error('binance '+r.status);return await r.json();}
+async function fetchBinance(sym,interval,limit){const u='https://fapi.binance.com/fapi/v1/klines?symbol='+sym+'&interval='+interval+'&limit='+limit;const r=await fetch(u);if(!r.ok)throw new Error('binance '+r.status);return await r.json();}
+async function fetchHL(coin,interval,limit){
+  const ms=HL_MS[interval]||3600000,end=Date.now(),start=end-limit*ms;
+  const r=await fetch(HL_INFO,{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({type:'candleSnapshot',req:{coin:coin,interval:interval,startTime:start,endTime:end}})});
+  if(!r.ok)throw new Error('HL '+r.status);
+  const d=await r.json();
+  // map HL candle {t,o,h,l,c,v} -> the Binance-kline array shape [openTime,open,high,low,close,vol] that computePayload reads
+  return (d||[]).map(k=>[k.t,k.o,k.h,k.l,k.c,k.v]);
+}
+async function fetchK(symKey,interval,limit){return HLSYM[symKey]?fetchHL(HLSYM[symKey],interval,limit):fetchBinance(FAPI[symKey],interval,limit);}
 async function poll(){
-  const fs=FAPI[SYM];status('fetching '+SYM+'…');
+  status('fetching '+SYM+'…');const src=HLSYM[SYM]?'Hyperliquid':'Binance';
   try{
-    const [k5,k1]=await Promise.all([fetchK(fs,'5m',1500),fetchK(fs,'1h',500)]);
+    const [k5,k1]=await Promise.all([fetchK(SYM,'5m',1500),fetchK(SYM,'1h',500)]);
     const d={'5m':RenkoCompute.computePayload(SYM,'5m',k5,true),'1h':RenkoCompute.computePayload(SYM,'1h',k1,false)};
     LAST=d;document.getElementById('sym').textContent=SYM;draw(d);status('on-device · '+new Date().toLocaleTimeString());
-  }catch(e){status('error: '+e+' (Binance blocked? try wifi/VPN)');}
+  }catch(e){status('error: '+e+' ('+src+' blocked? try wifi/VPN)');}
 }
 // --- settings persistence + signal alerts ---
 const TOGS=['t_qual','t_bubble','t_chand','t_star','t_dema','t_fib','t_lines','t_alerts'];
 function saveSettings(){try{const s={SYM:SYM,adx:document.getElementById('adx_slider').value};TOGS.forEach(id=>s[id]=on(id));localStorage.setItem('renkoSettings',JSON.stringify(s));}catch(e){}}
-function loadSettings(){try{const s=JSON.parse(localStorage.getItem('renkoSettings')||'{}');if(s.SYM&&FAPI[s.SYM])SYM=s.SYM;if(s.adx!==undefined){document.getElementById('adx_slider').value=s.adx;document.getElementById('adxval').textContent=s.adx;}TOGS.forEach(id=>{if(typeof s[id]==='boolean')document.getElementById(id).checked=s[id];});}catch(e){}}
+function loadSettings(){try{const s=JSON.parse(localStorage.getItem('renkoSettings')||'{}');if(s.SYM&&(FAPI[s.SYM]||HLSYM[s.SYM]))SYM=s.SYM;if(s.adx!==undefined){document.getElementById('adx_slider').value=s.adx;document.getElementById('adxval').textContent=s.adx;}TOGS.forEach(id=>{if(typeof s[id]==='boolean')document.getElementById(id).checked=s[id];});}catch(e){}}
 let lastAlert={};try{lastAlert=JSON.parse(localStorage.getItem('lastAlert')||'{}');}catch(e){}
 function beep(dir){try{const a=new (window.AudioContext||window.webkitAudioContext)();const o=a.createOscillator(),g=a.createGain();o.connect(g);g.connect(a.destination);o.type='sine';o.frequency.value=dir>0?880:430;g.gain.value=0.07;o.start();setTimeout(()=>{o.stop();a.close();},190);}catch(e){}}
 function notify(sym,tf,s){const buy=s.dir===1,title=(buy?'▲ BUY ':'▼ SELL ')+sym+' '+tf,body=Number(s.price).toLocaleString()+' · Fib '+s.fib+(s.adx?(' · ADX '+s.adx):'');
